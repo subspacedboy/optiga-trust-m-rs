@@ -8,23 +8,26 @@ use optiga_trust_m_rs::cmd::types::Oid;
 use optiga_trust_m_rs::error::IfxI2cError;
 use optiga_trust_m_rs::ifx_i2c::headers::{PlRegister, ProtectionConfig, ProtectionLevel, ResetType};
 use optiga_trust_m_rs::pal::rust_crypto::RustCryptoBackend;
-use optiga_trust_m_rs::OptigaTrustM;
+use optiga_trust_m_rs::{OptigaFor, OptigaPlatform, OptigaTrustM};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+struct AdvPlatform;
+
+impl OptigaPlatform for AdvPlatform {
+    type I2c = FaultInjectingI2cBus;
+    type Timer = SimulatedClock;
+    type VddPin = MockPin;
+    type RstPin = MockPin;
+    type Crypto = RustCryptoBackend;
+    type Datastore = InMemoryDatastore;
+}
 
 type AdvRig = (
     SimulatedClock,
     Rc<RefCell<VirtualOptiga>>,
     FaultInjectingI2cBus,
-    OptigaTrustM<
-        FaultInjectingI2cBus,
-        SimulatedClock,
-        MockPin,
-        MockPin,
-        SimulatedClock,
-        RustCryptoBackend,
-        InMemoryDatastore,
-    >,
+    OptigaFor<AdvPlatform>,
 );
 
 fn setup_adv_rig() -> AdvRig {
@@ -37,10 +40,12 @@ fn setup_adv_rig() -> AdvRig {
     let vdd = MockPin::new(clock.clone(), embedded_hal::digital::PinState::High);
     let rst = MockPin::new(clock.clone(), embedded_hal::digital::PinState::High);
 
-    let crypto = RustCryptoBackend;
     let ds = InMemoryDatastore::new();
 
-    let optiga = OptigaTrustM::new(bus.clone(), clock.clone(), vdd, rst, clock.clone(), crypto, ds);
+    let optiga = OptigaTrustM::builder(bus.clone(), clock.clone())
+        .with_pins(vdd, rst)
+        .with_datastore(ds)
+        .build();
     (clock, shared_chip, bus, optiga)
 }
 

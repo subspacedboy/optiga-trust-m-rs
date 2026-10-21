@@ -19,7 +19,6 @@ type StackRig = (
         SimulatedClock,
         MockPin,
         MockPin,
-        SimulatedClock,
         RustCryptoBackend,
         InMemoryDatastore,
     >,
@@ -38,7 +37,7 @@ fn setup_stack() -> StackRig {
     let crypto = RustCryptoBackend;
     let ds = InMemoryDatastore::new();
 
-    let stack = IfxI2cStack::new(bus, clock.clone(), vdd, rst, clock.clone(), crypto, ds);
+    let stack = IfxI2cStack::new(bus, clock.clone(), vdd, rst, crypto, ds);
     (clock, shared_chip, stack)
 }
 

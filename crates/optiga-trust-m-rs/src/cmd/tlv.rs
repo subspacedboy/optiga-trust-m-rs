@@ -30,6 +30,31 @@ impl<'a> TlvWriter<'a> {
         Ok(())
     }
 
+    /// Appends a TLV item whose value is the concatenation of `part1` and `part2`.
+    pub fn write_tlv_concat(
+        &mut self,
+        tag: u8,
+        part1: &[u8],
+        part2: &[u8],
+    ) -> Result<(), OptigaError> {
+        let total_len = part1.len() + part2.len();
+        let len = u16::try_from(total_len).map_err(|_| OptigaError::InvalidInput)?;
+        if self.pos + 3 + total_len > self.buf.len() {
+            return Err(OptigaError::MemoryInsufficient);
+        }
+
+        self.buf[self.pos] = tag;
+        let len_be = len.to_be_bytes();
+        self.buf[self.pos + 1] = len_be[0];
+        self.buf[self.pos + 2] = len_be[1];
+        let start1 = self.pos + 3;
+        let start2 = start1 + part1.len();
+        self.buf[start1..start2].copy_from_slice(part1);
+        self.buf[start2..start2 + part2.len()].copy_from_slice(part2);
+        self.pos += 3 + total_len;
+        Ok(())
+    }
+
     /// Returns the written slice.
     pub fn finish(self) -> &'a [u8] {
         &self.buf[..self.pos]

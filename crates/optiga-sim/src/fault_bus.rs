@@ -109,13 +109,13 @@ impl I2c for FaultInjectingI2cBus {
             .handle_read(address, read)
             .map_err(BusError::Chip)?;
 
-        // Check if read byte corruption should be applied
+        // Check if read byte corruption should be applied (only on reads large enough to contain `offset`)
         let mut rules = self.rules.borrow_mut();
         if let Some(FaultRule::CorruptNextReadByte { offset, mask }) = rules.front().copied() {
             if offset < read.len() {
                 read[offset] ^= mask;
+                rules.pop_front();
             }
-            rules.pop_front();
         }
 
         Ok(())
@@ -183,6 +183,39 @@ impl OptigaI2cBus for FaultInjectingI2cBus {
         }
         *self.current_bitrate_khz.borrow_mut() = bitrate_khz;
         Ok(())
+    }
+}
+
+impl embedded_hal_async::i2c::I2c for FaultInjectingI2cBus {
+    async fn read(&mut self, address: u8, read: &mut [u8]) -> Result<(), Self::Error> {
+        I2c::read(self, address, read)
+    }
+
+    async fn write(&mut self, address: u8, write: &[u8]) -> Result<(), Self::Error> {
+        I2c::write(self, address, write)
+    }
+
+    async fn write_read(
+        &mut self,
+        address: u8,
+        write: &[u8],
+        read: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        I2c::write_read(self, address, write, read)
+    }
+
+    async fn transaction(
+        &mut self,
+        address: u8,
+        operations: &mut [embedded_hal::i2c::Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        I2c::transaction(self, address, operations)
+    }
+}
+
+impl optiga_trust_m_rs::pal::AsyncOptigaI2cBus for FaultInjectingI2cBus {
+    async fn set_bitrate_khz(&mut self, bitrate_khz: u16) -> Result<(), Self::Error> {
+        OptigaI2cBus::set_bitrate_khz(self, bitrate_khz)
     }
 }
 

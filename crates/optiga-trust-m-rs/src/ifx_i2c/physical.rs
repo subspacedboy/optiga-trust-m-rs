@@ -6,45 +6,48 @@
 use crate::config::*;
 use crate::error::IfxI2cError;
 use crate::ifx_i2c::headers::{I2cStateStatus, PlRegister, ResetType};
-use crate::pal::{MonotonicClock, OptigaI2cBus};
-use embedded_hal::delay::DelayNs;
+use crate::pal::{NoPin, OptigaI2cBus, OptigaTimer};
 use embedded_hal::digital::OutputPin;
 
 /// Physical Layer driver managing raw I2C register communication and reset sequences.
-pub struct PhysicalLayer<I2C, D, VDD, RST> {
+pub struct PhysicalLayer<I2C, T, VDD = NoPin, RST = NoPin> {
     pub i2c: I2C,
-    pub delay: D,
+    pub delay: T,
     pub vdd_pin: VDD,
     pub rst_pin: RST,
     pub slave_address: u8,
+    pub configured_base_address: u8,
     pub negotiated_frame_size: u16,
     pub negotiated_frequency_khz: u16,
 }
 
-impl<I2C, D, VDD, RST> PhysicalLayer<I2C, D, VDD, RST>
+impl<I2C, T, VDD, RST> PhysicalLayer<I2C, T, VDD, RST>
 where
     I2C: OptigaI2cBus,
-    D: DelayNs,
+    T: OptigaTimer,
     VDD: OutputPin,
     RST: OutputPin,
 {
     /// Creates a new `PhysicalLayer` instance with default configuration.
-    pub fn new(i2c: I2C, delay: D, vdd_pin: VDD, rst_pin: RST) -> Self {
+    pub fn new(i2c: I2C, delay: T, vdd_pin: VDD, rst_pin: RST) -> Self {
         Self {
             i2c,
             delay,
             vdd_pin,
             rst_pin,
             slave_address: IFX_I2C_BASE_ADDR,
+            configured_base_address: IFX_I2C_BASE_ADDR,
             negotiated_frame_size: MIN_FRAME_SIZE as u16,
             negotiated_frequency_khz: PL_DEFAULT_FREQUENCY_KHZ,
         }
     }
 
-    /// Sets the runtime 7-bit slave address used for I2C transactions.
+    /// Sets the runtime and base 7-bit slave address used for I2C transactions.
     #[inline]
     pub fn set_slave_address(&mut self, addr: u8) {
-        self.slave_address = addr & 0x7F;
+        let addr_7bit = addr & 0x7F;
+        self.slave_address = addr_7bit;
+        self.configured_base_address = addr_7bit;
     }
 
     /// Writes data to a physical register with mandatory guard time and retry polling.
@@ -126,6 +129,7 @@ where
                 self.delay.delay_us(RESET_LOW_TIME_US);
                 let _ = self.vdd_pin.set_high();
                 let _ = self.rst_pin.set_high();
+                self.slave_address = self.configured_base_address;
                 self.delay.delay_us(STARTUP_TIME_US);
                 Ok(())
             }
@@ -133,6 +137,7 @@ where
                 let _ = self.rst_pin.set_low();
                 self.delay.delay_us(RESET_LOW_TIME_US);
                 let _ = self.rst_pin.set_high();
+                self.slave_address = self.configured_base_address;
                 self.delay.delay_us(STARTUP_TIME_US);
                 Ok(())
             }
@@ -147,6 +152,7 @@ where
 
                 // Write 0x0000 to SOFT_RESET register (0x88)
                 self.write_register(PlRegister::SoftReset, &[0x00, 0x00])?;
+                self.slave_address = self.configured_base_address;
                 self.delay.delay_us(STARTUP_TIME_US);
                 Ok(())
             }
@@ -217,10 +223,9 @@ where
     }
 
     /// Polls `PlRegister::I2cState` (`0x82`) until a response frame is ready, then reads it from `0x80`.
-    pub fn receive_frame<CLK: MonotonicClock>(
+    pub fn receive_frame(
         &mut self,
         rx_buf: &mut [u8],
-        clock: &CLK,
         frame_start_time_ms: u32,
         data_poll_timeout_ms: u32,
     ) -> Result<usize, IfxI2cError> {
@@ -237,7 +242,7 @@ where
                 }
             }
 
-            let elapsed = clock.now_ms().wrapping_sub(frame_start_time_ms);
+            let elapsed = self.delay.now_ms().wrapping_sub(frame_start_time_ms);
             if elapsed < data_poll_timeout_ms {
                 self.delay.delay_us(PL_DATA_POLLING_INTERVAL_US);
             } else {
@@ -252,6 +257,9 @@ where
         let addr_7bit = new_addr & 0x7F;
         self.write_register(PlRegister::BaseAddr, &[mode, addr_7bit])?;
         self.slave_address = addr_7bit;
+        if persistent {
+            self.configured_base_address = addr_7bit;
+        }
         // 10 ms delay for internal NVM programming
         self.delay.delay_ms(10);
         Ok(())

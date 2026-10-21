@@ -10,8 +10,7 @@ use crate::ifx_i2c::headers::{
     crc16_ccitt, Fctr, FrameType, SeqCtrl,
 };
 use crate::ifx_i2c::physical::PhysicalLayer;
-use crate::pal::{MonotonicClock, OptigaI2cBus};
-use embedded_hal::delay::DelayNs;
+use crate::pal::{OptigaI2cBus, OptigaTimer};
 use embedded_hal::digital::OutputPin;
 
 /// Event result from a Data Link Layer operation.
@@ -30,8 +29,8 @@ pub struct DataLinkLayer {
     pub tx_seq_nr: u8,
     pub rx_seq_nr: u8,
     pub resynced: bool,
-    tx_frame_buffer: [u8; MAX_FRAME_SIZE],
-    rx_frame_buffer: [u8; MAX_FRAME_SIZE],
+    pub(crate) tx_frame_buffer: [u8; MAX_FRAME_SIZE],
+    pub(crate) rx_frame_buffer: [u8; MAX_FRAME_SIZE],
 }
 
 impl Default for DataLinkLayer {
@@ -60,19 +59,17 @@ impl DataLinkLayer {
     }
 
     /// Transmits a payload of up to 272 bytes with ARQ retransmission and RESYNC recovery.
-    pub fn send_frame<I2C, D, VDD, RST, CLK>(
+    pub fn send_frame<I2C, T, VDD, RST>(
         &mut self,
-        pl: &mut PhysicalLayer<I2C, D, VDD, RST>,
-        clock: &CLK,
+        pl: &mut PhysicalLayer<I2C, T, VDD, RST>,
         payload: &[u8],
         rx_buf: &mut [u8],
     ) -> Result<DlEvent, IfxI2cError>
     where
         I2C: OptigaI2cBus,
-        D: DelayNs,
+        T: OptigaTimer,
         VDD: OutputPin,
         RST: OutputPin,
-        CLK: MonotonicClock,
     {
         if payload.len() > DL_MAX_PAYLOAD_SIZE {
             return Err(IfxI2cError::MemoryInsufficient);
@@ -81,110 +78,153 @@ impl DataLinkLayer {
         // Advance TX sequence number modulo 4
         self.tx_seq_nr = (self.tx_seq_nr + 1) & 0x03;
         self.resynced = false;
+        let mut already_resynced = false;
 
-        // Construct Data Frame in internal tx_frame_buffer
-        let fctr = Fctr::new(FrameType::Data, SeqCtrl::Ack, self.tx_seq_nr, self.rx_seq_nr);
-        self.tx_frame_buffer[0] = fctr.0;
         let payload_len_be = (payload.len() as u16).to_be_bytes();
         self.tx_frame_buffer[1] = payload_len_be[0];
         self.tx_frame_buffer[2] = payload_len_be[1];
         self.tx_frame_buffer[3..3 + payload.len()].copy_from_slice(payload);
-
-        let crc = crc16_ccitt(&self.tx_frame_buffer[..3 + payload.len()]);
-        let crc_be = crc.to_be_bytes();
-        self.tx_frame_buffer[3 + payload.len()] = crc_be[0];
-        self.tx_frame_buffer[4 + payload.len()] = crc_be[1];
-
         let total_tx_len = 5 + payload.len();
 
         let mut retransmit_counter = 0;
         loop {
+            if self.resynced {
+                self.tx_seq_nr = (self.tx_seq_nr + 1) & 0x03;
+                self.resynced = false;
+            }
+
+            // Update FCTR and CRC-16 (reflecting current tx_seq_nr and rx_seq_nr)
+            let fctr = Fctr::new(FrameType::Data, SeqCtrl::Ack, self.tx_seq_nr, self.rx_seq_nr);
+            self.tx_frame_buffer[0] = fctr.0;
+            let crc = crc16_ccitt(&self.tx_frame_buffer[..3 + payload.len()]);
+            let crc_be = crc.to_be_bytes();
+            self.tx_frame_buffer[3 + payload.len()] = crc_be[0];
+            self.tx_frame_buffer[4 + payload.len()] = crc_be[1];
+
             // Step 1: Send frame via Physical Layer
             pl.send_frame(&self.tx_frame_buffer[..total_tx_len])?;
 
             // Step 2: Poll for immediate response from slave (10 ms timeout)
-            let poll_start = clock.now_ms();
-            match pl.receive_frame(&mut self.rx_frame_buffer, clock, poll_start, PL_TRANS_TIMEOUT_MS) {
-                Ok(rx_len) => {
-                    // Validate received frame
-                    match self.parse_rx_frame(rx_len) {
-                        Ok(FrameType::Control) => {
-                            let resp_fctr = Fctr(self.rx_frame_buffer[0]);
-                            match resp_fctr.seq_ctrl() {
-                                SeqCtrl::Ack => {
-                                    if resp_fctr.ack_nr() == self.tx_seq_nr {
-                                        return Ok(DlEvent::TxSuccess);
+            'wait_ack: loop {
+                let poll_start = pl.delay.now_ms();
+                match pl.receive_frame(
+                    &mut self.rx_frame_buffer,
+                    poll_start,
+                    PL_TRANS_TIMEOUT_MS,
+                ) {
+                    Ok(rx_len) => {
+                        // Validate received frame
+                        match self.parse_rx_frame(rx_len) {
+                            Ok(FrameType::Control) => {
+                                let resp_fctr = Fctr(self.rx_frame_buffer[0]);
+                                match resp_fctr.seq_ctrl() {
+                                    SeqCtrl::Ack => {
+                                        if resp_fctr.ack_nr() == self.tx_seq_nr {
+                                            return Ok(DlEvent::TxSuccess);
+                                        }
                                     }
+                                    SeqCtrl::Nack => {
+                                        // Slave NACKed our frame; trigger retransmit
+                                    }
+                                    _ => {}
                                 }
-                                SeqCtrl::Nack => {
-                                    // Slave NACKed our frame; trigger retransmit
-                                }
-                                _ => {}
+                                break 'wait_ack;
                             }
-                        }
-                        Ok(FrameType::Data) => {
-                            // Piggybacked Data Frame response!
-                            let resp_fctr = Fctr(self.rx_frame_buffer[0]);
-                            if resp_fctr.ack_nr() == self.tx_seq_nr {
+                            Ok(FrameType::Data) => {
+                                // Piggybacked Data Frame response!
+                                let resp_fctr = Fctr(self.rx_frame_buffer[0]);
                                 let expected_rx = (self.rx_seq_nr + 1) & 0x03;
-                                if resp_fctr.fr_nr() == expected_rx {
-                                    self.rx_seq_nr = expected_rx;
-                                    let data_len = rx_len - 5;
-                                    if data_len > rx_buf.len() {
-                                        return Err(IfxI2cError::MemoryInsufficient);
-                                    }
-                                    rx_buf[..data_len].copy_from_slice(&self.rx_frame_buffer[3..3 + data_len]);
+                                if resp_fctr.ack_nr() == self.tx_seq_nr
+                                    && resp_fctr.seq_ctrl() == SeqCtrl::Ack
+                                {
+                                    if resp_fctr.fr_nr() == expected_rx {
+                                        self.rx_seq_nr = expected_rx;
+                                        let data_len = rx_len - 5;
+                                        if data_len > rx_buf.len() {
+                                            return Err(IfxI2cError::MemoryInsufficient);
+                                        }
+                                        rx_buf[..data_len].copy_from_slice(
+                                            &self.rx_frame_buffer[3..3 + data_len],
+                                        );
 
-                                    // Send ACK Control Frame back to slave
-                                    self.send_control_frame(pl, SeqCtrl::Ack, self.rx_seq_nr)?;
-                                    return Ok(DlEvent::TxAndRxSuccess(data_len));
+                                        // Send ACK Control Frame back to slave
+                                        self.send_control_frame(pl, SeqCtrl::Ack, self.rx_seq_nr)?;
+                                        return Ok(DlEvent::TxAndRxSuccess(data_len));
+                                    } else if resp_fctr.fr_nr() == self.rx_seq_nr {
+                                        // Duplicate Data Frame from slave: ACK and keep listening
+                                        self.send_control_frame(pl, SeqCtrl::Ack, self.rx_seq_nr)?;
+                                        continue 'wait_ack;
+                                    } else {
+                                        // Out-of-order Data Frame from slave: NACK expected_rx
+                                        self.send_control_frame(pl, SeqCtrl::Nack, expected_rx)?;
+                                        continue 'wait_ack;
+                                    }
                                 }
+                                break 'wait_ack;
                             }
-                        }
-                        Err(_) => {
-                            // Frame corrupted or invalid; trigger retransmit
+                            Err(_) => {
+                                // If the corrupted frame was a multi-byte Data Frame from the slave,
+                                // send a NACK Control Frame so the slave retransmits its Data Frame.
+                                if rx_len > 5
+                                    && Fctr(self.rx_frame_buffer[0]).frame_type() == FrameType::Data
+                                {
+                                    retransmit_counter += 1;
+                                    if retransmit_counter >= DL_TRANS_REPEAT {
+                                        break 'wait_ack;
+                                    }
+                                    let expected_rx = (self.rx_seq_nr + 1) & 0x03;
+                                    self.send_control_frame(pl, SeqCtrl::Nack, expected_rx)?;
+                                    continue 'wait_ack;
+                                }
+                                break 'wait_ack;
+                            }
                         }
                     }
-                }
-                Err(_) => {
-                    // Receive timeout or PL error
+                    Err(_) => {
+                        // Receive timeout or PL error
+                        break 'wait_ack;
+                    }
                 }
             }
 
             // Retry or RESYNC
             retransmit_counter += 1;
             if retransmit_counter >= DL_TRANS_REPEAT {
-                self.perform_resync(pl, clock)?;
+                if already_resynced {
+                    return Err(IfxI2cError::ProtocolError);
+                }
+                self.perform_resync(pl)?;
+                already_resynced = true;
                 retransmit_counter = 0;
             }
         }
     }
 
     /// Receives a Data Link frame from the slave (up to 180s exit timeout).
-    pub fn receive_frame<I2C, D, VDD, RST, CLK>(
+    pub fn receive_frame<I2C, T, VDD, RST>(
         &mut self,
-        pl: &mut PhysicalLayer<I2C, D, VDD, RST>,
-        clock: &CLK,
+        pl: &mut PhysicalLayer<I2C, T, VDD, RST>,
         rx_buf: &mut [u8],
     ) -> Result<usize, IfxI2cError>
     where
         I2C: OptigaI2cBus,
-        D: DelayNs,
+        T: OptigaTimer,
         VDD: OutputPin,
         RST: OutputPin,
-        CLK: MonotonicClock,
     {
-        let start_time = clock.now_ms();
+        let start_time = pl.delay.now_ms();
         let mut retransmit_counter = 0;
+        let mut already_resynced = false;
 
         loop {
-            let elapsed = clock.now_ms().wrapping_sub(start_time);
+            let now = pl.delay.now_ms();
+            let elapsed = now.wrapping_sub(start_time);
             if elapsed >= TL_MAX_EXIT_TIMEOUT_MS {
                 return Err(IfxI2cError::ProtocolError);
             }
             let remaining_ms = TL_MAX_EXIT_TIMEOUT_MS - elapsed;
 
-            match pl.receive_frame(&mut self.rx_frame_buffer, clock, clock.now_ms(), remaining_ms) {
+            match pl.receive_frame(&mut self.rx_frame_buffer, now, remaining_ms) {
                 Ok(rx_len) => {
                     match self.parse_rx_frame(rx_len) {
                         Ok(FrameType::Data) => {
@@ -233,7 +273,11 @@ impl DataLinkLayer {
                 Err(_) => {
                     retransmit_counter += 1;
                     if retransmit_counter >= DL_TRANS_REPEAT {
-                        self.perform_resync(pl, clock)?;
+                        if already_resynced {
+                            return Err(IfxI2cError::ProtocolError);
+                        }
+                        self.perform_resync(pl)?;
+                        already_resynced = true;
                         retransmit_counter = 0;
                     }
                 }
@@ -242,25 +286,23 @@ impl DataLinkLayer {
     }
 
     /// Performs a Data Link RESYNC handshake with the slave.
-    pub fn perform_resync<I2C, D, VDD, RST, CLK>(
+    pub fn perform_resync<I2C, T, VDD, RST>(
         &mut self,
-        pl: &mut PhysicalLayer<I2C, D, VDD, RST>,
-        clock: &CLK,
+        pl: &mut PhysicalLayer<I2C, T, VDD, RST>,
     ) -> Result<(), IfxI2cError>
     where
         I2C: OptigaI2cBus,
-        D: DelayNs,
+        T: OptigaTimer,
         VDD: OutputPin,
         RST: OutputPin,
-        CLK: MonotonicClock,
     {
         self.reset();
         // Send RESYNC CF
         self.send_control_frame(pl, SeqCtrl::Resync, 0)?;
 
         // Wait for RESYNC CF response
-        let start = clock.now_ms();
-        if let Ok(rx_len) = pl.receive_frame(&mut self.rx_frame_buffer, clock, start, PL_TRANS_TIMEOUT_MS) {
+        let start = pl.delay.now_ms();
+        if let Ok(rx_len) = pl.receive_frame(&mut self.rx_frame_buffer, start, PL_TRANS_TIMEOUT_MS) {
             if rx_len == 5 {
                 let fctr = Fctr(self.rx_frame_buffer[0]);
                 if fctr.frame_type() == FrameType::Control && fctr.seq_ctrl() == SeqCtrl::Resync {
@@ -275,32 +317,33 @@ impl DataLinkLayer {
     }
 
     /// Sends a 5-byte Control Frame (ACK, NACK, or RESYNC).
-    pub fn send_control_frame<I2C, D, VDD, RST>(
+    pub fn send_control_frame<I2C, T, VDD, RST>(
         &mut self,
-        pl: &mut PhysicalLayer<I2C, D, VDD, RST>,
+        pl: &mut PhysicalLayer<I2C, T, VDD, RST>,
         seq_ctrl: SeqCtrl,
         ack_nr: u8,
     ) -> Result<(), IfxI2cError>
     where
         I2C: OptigaI2cBus,
-        D: DelayNs,
+        T: OptigaTimer,
         VDD: OutputPin,
         RST: OutputPin,
     {
-        let fctr = Fctr::new(FrameType::Control, seq_ctrl, 0, ack_nr);
-        let mut cf = [0u8; 5];
-        cf[0] = fctr.0;
-        cf[1] = 0x00;
-        cf[2] = 0x00;
-        let crc = crc16_ccitt(&cf[..3]);
-        let crc_be = crc.to_be_bytes();
-        cf[3] = crc_be[0];
-        cf[4] = crc_be[1];
-
+        let cf = Self::encode_control_frame(seq_ctrl, ack_nr);
         pl.send_frame(&cf)
     }
 
-    fn parse_rx_frame(&self, rx_len: usize) -> Result<FrameType, IfxI2cError> {
+    #[inline]
+    pub(crate) fn encode_control_frame(seq_ctrl: SeqCtrl, ack_nr: u8) -> [u8; 5] {
+        let fctr = Fctr::new(FrameType::Control, seq_ctrl, 0, ack_nr);
+        let mut cf = [fctr.0, 0x00, 0x00, 0x00, 0x00];
+        let crc = crc16_ccitt(&cf[..3]).to_be_bytes();
+        cf[3] = crc[0];
+        cf[4] = crc[1];
+        cf
+    }
+
+    pub(crate) fn parse_rx_frame(&self, rx_len: usize) -> Result<FrameType, IfxI2cError> {
         if rx_len < 5 {
             return Err(IfxI2cError::ProtocolError);
         }

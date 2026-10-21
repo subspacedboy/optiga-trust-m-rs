@@ -15,6 +15,7 @@ pub enum RegisterError {
 #[derive(Debug)]
 pub struct RegisterFile {
     pub slave_address: u8,
+    pub configured_base_address: u8,
     pub max_frame_len: u16,
     pub i2c_mode: u8,
     pub soft_reset_supported: bool,
@@ -29,6 +30,7 @@ impl Default for RegisterFile {
     fn default() -> Self {
         Self {
             slave_address: 0x30,
+            configured_base_address: 0x30,
             max_frame_len: 277,
             i2c_mode: 0x03, // SM/FM (400 kHz max)
             soft_reset_supported: true,
@@ -107,7 +109,11 @@ impl RegisterFile {
                     return Err(RegisterError::WriteLengthMismatch);
                 }
                 // data = [mode, addr & 0x7F]
-                self.slave_address = data[1] & 0x7F;
+                let addr_7bit = data[1] & 0x7F;
+                self.slave_address = addr_7bit;
+                if (data[0] & 0x80) != 0 {
+                    self.configured_base_address = addr_7bit;
+                }
                 Ok(())
             }
             PlRegister::SoftReset => {
@@ -130,7 +136,7 @@ impl RegisterFile {
 
     /// Resets register values to defaults.
     pub fn reset(&mut self) {
-        self.slave_address = 0x30;
+        self.slave_address = self.configured_base_address;
         self.max_frame_len = 277;
         self.i2c_mode = 0x03;
         self.is_busy = false;

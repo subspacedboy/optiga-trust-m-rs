@@ -4,13 +4,13 @@ pub mod tlv;
 pub mod types;
 
 pub use tlv::{TlvReader, TlvWriter};
-pub use types::{EccCurve, KeyUsage, Oid, SessionSlot};
+pub use types::{EccCurve, KdfAlg, KeyUsage, Oid, RngType, SessionSlot};
 
 use crate::error::{DeviceError, OptigaError};
 use crate::ifx_i2c::headers::{ProtectionConfig, ProtectionLevel};
 use crate::ifx_i2c::IfxI2cStack;
-use crate::pal::{Datastore, HostCrypto, MonotonicClock, OptigaI2cBus};
-use embedded_hal::delay::DelayNs;
+use crate::pal::rust_crypto::RustCryptoBackend;
+use crate::pal::{Datastore, HostCrypto, NoDatastore, NoPin, OptigaI2cBus, OptigaTimer};
 use embedded_hal::digital::OutputPin;
 
 /// Bit flag OR'd with opcodes to clear OPTIGA's last error register before execution.
@@ -36,27 +36,33 @@ pub mod opcodes {
 }
 
 /// Command Layer executing APDUs with automatic `0xF1C2` device error retrieval.
-pub struct OptigaCmd<I2C, D, VDD, RST, CLK, CRYPTO, DS> {
-    pub stack: IfxI2cStack<I2C, D, VDD, RST, CLK, CRYPTO, DS>,
-    tx_apdu_buf: [u8; 1557],
-    session_slots_mask: u8,
+pub struct OptigaCmd<
+    I2C,
+    T,
+    VDD = NoPin,
+    RST = NoPin,
+    CRYPTO = RustCryptoBackend,
+    DS = NoDatastore,
+> {
+    pub stack: IfxI2cStack<I2C, T, VDD, RST, CRYPTO, DS>,
+    pub(crate) apdu_buf: [u8; 1557],
+    pub(crate) session_slots_mask: u8,
 }
 
-impl<I2C, D, VDD, RST, CLK, CRYPTO, DS> OptigaCmd<I2C, D, VDD, RST, CLK, CRYPTO, DS>
+impl<I2C, T, VDD, RST, CRYPTO, DS> OptigaCmd<I2C, T, VDD, RST, CRYPTO, DS>
 where
     I2C: OptigaI2cBus,
-    D: DelayNs,
+    T: OptigaTimer,
     VDD: OutputPin,
     RST: OutputPin,
-    CLK: MonotonicClock,
     CRYPTO: HostCrypto,
     DS: Datastore,
 {
     /// Creates a new `OptigaCmd` instance wrapping `stack`.
-    pub fn new(stack: IfxI2cStack<I2C, D, VDD, RST, CLK, CRYPTO, DS>) -> Self {
+    pub fn new(stack: IfxI2cStack<I2C, T, VDD, RST, CRYPTO, DS>) -> Self {
         Self {
             stack,
-            tx_apdu_buf: [0u8; 1557],
+            apdu_buf: [0u8; 1557],
             session_slots_mask: 0,
         }
     }
@@ -77,6 +83,85 @@ where
         self.session_slots_mask &= !(1 << slot.index());
     }
 
+    /// Executes an APDU command by building `in_data` in-place inside `OptigaCmd`'s internal
+    /// buffer and processing `out_data` via a closure, requiring zero stack buffers.
+    pub fn execute_with_response<F, R, Out>(
+        &mut self,
+        cmd: u8,
+        param: u8,
+        build_in_data: F,
+        process_out_data: R,
+        protection: ProtectionConfig,
+    ) -> Result<Out, OptigaError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, OptigaError>,
+        R: FnOnce(&[u8]) -> Result<Out, OptigaError>,
+    {
+        let in_len = build_in_data(&mut self.apdu_buf[4..])?;
+        if in_len > 1553 {
+            return Err(OptigaError::MemoryInsufficient);
+        }
+
+        // Form 4-byte APDU header: [Cmd | 0x80, Param, InLength (2B BE)]
+        self.apdu_buf[0] = cmd | OPTIGA_CMD_CLEAR_LAST_ERROR;
+        self.apdu_buf[1] = param;
+        let in_len_be = (in_len as u16).to_be_bytes();
+        self.apdu_buf[2] = in_len_be[0];
+        self.apdu_buf[3] = in_len_be[1];
+        let total_apdu_len = 4 + in_len;
+
+        let rx_len = self
+            .stack
+            .transceive_in_place(&mut self.apdu_buf, total_apdu_len, protection)
+            .map_err(OptigaError::Comms)?;
+
+        if rx_len < 4 {
+            return Err(OptigaError::CommandError);
+        }
+
+        let sta = self.apdu_buf[0];
+        if sta == 0x00 {
+            // Success: [Sta=0x00, 0x00, OutLength (2B BE), OutData...]
+            let out_len = u16::from_be_bytes([self.apdu_buf[2], self.apdu_buf[3]]) as usize;
+            if rx_len < 4 + out_len {
+                return Err(OptigaError::MemoryInsufficient);
+            }
+            process_out_data(&self.apdu_buf[4..4 + out_len])
+        } else {
+            // Device failure: automatically read 0xF1C2 error register
+            let device_err = self.read_last_error_code(protection)?;
+            Err(OptigaError::Device(device_err))
+        }
+    }
+
+    /// Executes an APDU command by building `in_data` in-place inside `OptigaCmd`'s internal
+    /// buffer and copying response data into `rx_out`.
+    pub fn execute_with<F>(
+        &mut self,
+        cmd: u8,
+        param: u8,
+        build_in_data: F,
+        rx_out: &mut [u8],
+        protection: ProtectionConfig,
+    ) -> Result<usize, OptigaError>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, OptigaError>,
+    {
+        self.execute_with_response(
+            cmd,
+            param,
+            build_in_data,
+            |out_data| {
+                if out_data.len() > rx_out.len() {
+                    return Err(OptigaError::MemoryInsufficient);
+                }
+                rx_out[..out_data.len()].copy_from_slice(out_data);
+                Ok(out_data.len())
+            },
+            protection,
+        )
+    }
+
     /// Executes an APDU command over the stack.
     ///
     /// If the chip returns `Sta == 0xFF` (failure), this method automatically executes
@@ -90,47 +175,26 @@ where
         rx_out: &mut [u8],
         protection: ProtectionConfig,
     ) -> Result<usize, OptigaError> {
-        if in_data.len() > 1553 {
-            return Err(OptigaError::MemoryInsufficient);
-        }
-
-        // Form 4-byte APDU header: [Cmd | 0x80, Param, InLength (2B BE)]
-        self.tx_apdu_buf[0] = cmd | OPTIGA_CMD_CLEAR_LAST_ERROR;
-        self.tx_apdu_buf[1] = param;
-        let in_len_be = (in_data.len() as u16).to_be_bytes();
-        self.tx_apdu_buf[2] = in_len_be[0];
-        self.tx_apdu_buf[3] = in_len_be[1];
-        self.tx_apdu_buf[4..4 + in_data.len()].copy_from_slice(in_data);
-        let total_apdu_len = 4 + in_data.len();
-
-        let mut apdu_rx_buf = [0u8; 1557];
-        let rx_len = self
-            .stack
-            .transceive(&self.tx_apdu_buf[..total_apdu_len], &mut apdu_rx_buf, protection)
-            .map_err(OptigaError::Comms)?;
-
-        if rx_len < 4 {
-            return Err(OptigaError::CommandError);
-        }
-
-        let sta = apdu_rx_buf[0];
-        if sta == 0x00 {
-            // Success: [Sta=0x00, 0x00, OutLength (2B BE), OutData...]
-            let out_len = u16::from_be_bytes([apdu_rx_buf[2], apdu_rx_buf[3]]) as usize;
-            if rx_len < 4 + out_len || out_len > rx_out.len() {
-                return Err(OptigaError::MemoryInsufficient);
-            }
-            rx_out[..out_len].copy_from_slice(&apdu_rx_buf[4..4 + out_len]);
-            Ok(out_len)
-        } else {
-            // Device failure: automatically read 0xF1C2 error register
-            let device_err = self.read_last_error_code()?;
-            Err(OptigaError::Device(device_err))
-        }
+        self.execute_with(
+            cmd,
+            param,
+            |buf| {
+                if in_data.len() > buf.len() {
+                    return Err(OptigaError::MemoryInsufficient);
+                }
+                buf[..in_data.len()].copy_from_slice(in_data);
+                Ok(in_data.len())
+            },
+            rx_out,
+            protection,
+        )
     }
 
     /// Automatically reads 1 byte from `0xF1C2` without `0x80` clear flag.
-    fn read_last_error_code(&mut self) -> Result<DeviceError, OptigaError> {
+    fn read_last_error_code(
+        &mut self,
+        protection: ProtectionConfig,
+    ) -> Result<DeviceError, OptigaError> {
         // Form GetDataObject APDU for 0xF1C2:
         // [Cmd=0x01, Param=0x00, Len=0x0006, OID=0xF1C2, Offset=0x0000, Len=0x0001]
         let get_err_apdu = [
@@ -146,21 +210,25 @@ where
             0x01, // Length 0x0001
         ];
 
-        let mut apdu_rx_buf = [0u8; 64];
+        self.apdu_buf[..get_err_apdu.len()].copy_from_slice(&get_err_apdu);
         let rx_len = self
             .stack
-            .transceive(
-                &get_err_apdu,
-                &mut apdu_rx_buf,
+            .transceive_in_place(
+                &mut self.apdu_buf,
+                get_err_apdu.len(),
                 ProtectionConfig {
-                    level: ProtectionLevel::None,
+                    level: if self.stack.prl.negotiation_state {
+                        protection.level
+                    } else {
+                        ProtectionLevel::None
+                    },
                     force_reestablish: false,
                 },
             )
             .map_err(OptigaError::Comms)?;
 
-        if rx_len >= 5 && apdu_rx_buf[0] == 0x00 {
-            let err_byte = apdu_rx_buf[4];
+        if rx_len >= 5 && self.apdu_buf[0] == 0x00 {
+            let err_byte = self.apdu_buf[4];
             Ok(DeviceError::from(err_byte))
         } else {
             Ok(DeviceError::GeneralError)

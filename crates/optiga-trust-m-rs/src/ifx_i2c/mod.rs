@@ -16,45 +16,48 @@ pub use presentation::PresentationLayer;
 pub use transport::TransportLayer;
 
 use crate::error::IfxI2cError;
-use crate::pal::{Datastore, HostCrypto, MonotonicClock, OptigaI2cBus};
-use embedded_hal::delay::DelayNs;
+use crate::pal::rust_crypto::RustCryptoBackend;
+use crate::pal::{Datastore, HostCrypto, NoDatastore, NoPin, OptigaI2cBus, OptigaTimer};
 use embedded_hal::digital::OutputPin;
 
 /// Top-level coordinator of the 4-layer `ifx_i2c` protocol stack.
-pub struct IfxI2cStack<I2C, D, VDD, RST, CLK, CRYPTO, DS> {
-    pub pl: PhysicalLayer<I2C, D, VDD, RST>,
+pub struct IfxI2cStack<
+    I2C,
+    T,
+    VDD = NoPin,
+    RST = NoPin,
+    CRYPTO = RustCryptoBackend,
+    DS = NoDatastore,
+> {
+    pub pl: PhysicalLayer<I2C, T, VDD, RST>,
     pub dl: DataLinkLayer,
     pub tl: TransportLayer,
     pub prl: PresentationLayer<CRYPTO, DS>,
-    pub clock: CLK,
 }
 
-impl<I2C, D, VDD, RST, CLK, CRYPTO, DS> IfxI2cStack<I2C, D, VDD, RST, CLK, CRYPTO, DS>
+impl<I2C, T, VDD, RST, CRYPTO, DS> IfxI2cStack<I2C, T, VDD, RST, CRYPTO, DS>
 where
     I2C: OptigaI2cBus,
-    D: DelayNs,
+    T: OptigaTimer,
     VDD: OutputPin,
     RST: OutputPin,
-    CLK: MonotonicClock,
     CRYPTO: HostCrypto,
     DS: Datastore,
 {
-    /// Creates a new `IfxI2cStack` with the given hardware peripherals, clock, and crypto/storage providers.
+    /// Creates a new `IfxI2cStack` with the given hardware peripherals, timer, and crypto/storage providers.
     pub fn new(
         i2c: I2C,
-        delay: D,
+        timer: T,
         vdd_pin: VDD,
         rst_pin: RST,
-        clock: CLK,
         crypto: CRYPTO,
         datastore: DS,
     ) -> Self {
         Self {
-            pl: PhysicalLayer::new(i2c, delay, vdd_pin, rst_pin),
+            pl: PhysicalLayer::new(i2c, timer, vdd_pin, rst_pin),
             dl: DataLinkLayer::new(),
             tl: TransportLayer::new(),
             prl: PresentationLayer::new(crypto, datastore),
-            clock,
         }
     }
 
@@ -91,9 +94,26 @@ where
             &mut self.pl,
             &mut self.dl,
             &mut self.tl,
-            &self.clock,
             tx,
             rx,
+            protection,
+        )
+    }
+
+    /// Transceives an APDU command payload in-place using `apdu_buf[..tx_len]` as input
+    /// and writing the response into `apdu_buf[..rx_len]`.
+    pub fn transceive_in_place(
+        &mut self,
+        apdu_buf: &mut [u8],
+        tx_len: usize,
+        protection: ProtectionConfig,
+    ) -> Result<usize, IfxI2cError> {
+        self.prl.transceive_in_place(
+            &mut self.pl,
+            &mut self.dl,
+            &mut self.tl,
+            apdu_buf,
+            tx_len,
             protection,
         )
     }
@@ -102,7 +122,7 @@ where
     pub fn close(&mut self, save_context: bool) -> Result<(), IfxI2cError> {
         if save_context {
             self.prl
-                .save_context(&mut self.pl, &mut self.dl, &mut self.tl, &self.clock)?;
+                .save_context(&mut self.pl, &mut self.dl, &mut self.tl)?;
         } else {
             self.prl.reset();
         }
@@ -112,7 +132,7 @@ where
     /// Restores a previously saved session context across hibernate cycles.
     pub fn restore_context(&mut self) -> Result<(), IfxI2cError> {
         self.prl
-            .restore_context(&mut self.pl, &mut self.dl, &mut self.tl, &self.clock)
+            .restore_context(&mut self.pl, &mut self.dl, &mut self.tl)
     }
 
     /// Configures a new 7-bit I2C slave address.

@@ -110,6 +110,52 @@ pub enum EccCurve {
     BrainpoolP512r1 = 0x16,
 }
 
+impl EccCurve {
+    /// Returns the expected shared secret length in bytes for ECDH on this curve.
+    #[inline]
+    pub const fn shared_secret_len(&self) -> usize {
+        match self {
+            Self::NistP256 | Self::BrainpoolP256r1 => 32,
+            Self::NistP384 | Self::BrainpoolP384r1 => 48,
+            Self::BrainpoolP512r1 => 64,
+            Self::NistP521 => 66,
+        }
+    }
+
+    /// Returns the exported private key length in bytes for `GenKeyPair` on this curve.
+    #[inline]
+    pub const fn private_key_len(&self) -> usize {
+        match self {
+            Self::NistP256 | Self::BrainpoolP256r1 => 0x22,
+            Self::NistP384 | Self::BrainpoolP384r1 => 0x32,
+            Self::BrainpoolP512r1 => 0x42,
+            Self::NistP521 => 0x44,
+        }
+    }
+}
+
+/// Random number generator modes supported by `GetRandom` (`0x0C`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RngType {
+    /// True Random Number Generator (`0x00`).
+    Trng = 0x00,
+    /// Deterministic Random Number Generator (`0x01`).
+    Drng = 0x01,
+}
+
+/// Key derivation function algorithms supported by `DeriveKey` (`0x34`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KdfAlg {
+    TlsPrfSha256 = 0x01,
+    TlsPrfSha384 = 0x02,
+    TlsPrfSha512 = 0x03,
+    HkdfSha256 = 0x08,
+    HkdfSha384 = 0x09,
+    HkdfSha512 = 0x0A,
+}
+
 /// Key usage flags for generated keypairs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyUsage(pub u8);
@@ -129,8 +175,12 @@ impl KeyUsage {
     }
 }
 
-/// Type-safe handle to one of the 4 volatile session slots (`0xE100..=0xE103`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Move-only handle to one of the 4 volatile session slots (`0xE100..=0xE103`).
+///
+/// This type intentionally does not implement `Copy` or `Clone` so that releasing a
+/// session slot via `release_session_slot(slot)` consumes the handle and prevents
+/// use-after-release bugs at compile time.
+#[derive(Debug, PartialEq, Eq)]
 pub struct SessionSlot {
     index: u8, // 0..=3
 }

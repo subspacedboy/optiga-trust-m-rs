@@ -3,6 +3,7 @@
 pub mod rust_crypto;
 
 use core::fmt::Debug;
+use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 use embedded_hal::i2c::I2c;
 
@@ -18,6 +19,33 @@ pub trait MonotonicClock {
     /// Returns current monotonic tick count in milliseconds.
     fn now_ms(&self) -> u32;
 }
+
+/// Unified timer trait combining sub-millisecond delays (`DelayNs`) and
+/// a monotonic millisecond tick counter (`MonotonicClock`).
+///
+/// Automatically implemented for any type implementing both `DelayNs` and `MonotonicClock`.
+pub trait OptigaTimer: DelayNs + MonotonicClock {}
+
+impl<T: DelayNs + MonotonicClock> OptigaTimer for T {}
+
+/// Asynchronous extension of `embedded_hal_async::i2c::I2c` supporting dynamic bus speed negotiation.
+#[cfg(feature = "async")]
+#[allow(async_fn_in_trait)]
+pub trait AsyncOptigaI2cBus: embedded_hal_async::i2c::I2c {
+    /// Sets the I2C master clock frequency in kHz (e.g., 100 for standard negotiation, up to 1000 for FM+).
+    /// Returns `Err` if the bitrate cannot be configured.
+    async fn set_bitrate_khz(&mut self, bitrate_khz: u16) -> Result<(), Self::Error>;
+}
+
+/// Unified asynchronous timer trait combining non-blocking delays (`embedded_hal_async::delay::DelayNs`)
+/// and a monotonic millisecond tick counter (`MonotonicClock`).
+///
+/// Automatically implemented for any type implementing both `embedded_hal_async::delay::DelayNs` and `MonotonicClock`.
+#[cfg(feature = "async")]
+pub trait AsyncOptigaTimer: embedded_hal_async::delay::DelayNs + MonotonicClock {}
+
+#[cfg(feature = "async")]
+impl<T: embedded_hal_async::delay::DelayNs + MonotonicClock> AsyncOptigaTimer for T {}
 
 /// Well-known datastore slot identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,5 +124,24 @@ impl OutputPin for NoPin {
     #[inline]
     fn set_high(&mut self) -> Result<(), Self::Error> {
         Ok(())
+    }
+}
+
+/// No-op datastore implementation for unshielded configurations where platform binding
+/// secrets and hibernate context persistence are not required.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDatastore;
+
+impl Datastore for NoDatastore {
+    type Error = ();
+
+    #[inline]
+    fn read(&self, _id: DatastoreId, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+        Err(())
+    }
+
+    #[inline]
+    fn write(&mut self, _id: DatastoreId, _data: &[u8]) -> Result<(), Self::Error> {
+        Err(())
     }
 }

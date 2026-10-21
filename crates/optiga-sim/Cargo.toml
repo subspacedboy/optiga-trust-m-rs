@@ -9,6 +9,7 @@ description = "Host-side virtual OPTIGA Trust M hardware emulator and fault inje
 [dependencies]
 optiga-trust-m-rs = { workspace = true }
 embedded-hal = { workspace = true }
+embedded-hal-async = { workspace = true }
 aes = { workspace = true }
 ccm = { workspace = true }
 sha2 = { workspace = true }

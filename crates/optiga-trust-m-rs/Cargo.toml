@@ -7,8 +7,13 @@ rust-version.workspace = true
 description = "Pure Rust, #![no_std], zero-heap driver for Infineon OPTIGA Trust M security chip"
 readme = "README.md"
 
+[features]
+default = ["async"]
+async = ["dep:embedded-hal-async"]
+
 [dependencies]
 embedded-hal = { workspace = true }
+embedded-hal-async = { workspace = true, optional = true }
 aes = { workspace = true }
 ccm = { workspace = true }
 sha2 = { workspace = true }

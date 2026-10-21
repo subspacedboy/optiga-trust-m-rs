@@ -1,8 +1,11 @@
 //! Simulated APDU and Presentation Layer responder for OPTIGA Trust M.
 
+use optiga_trust_m_rs::cmd::tlv::TlvReader;
+use optiga_trust_m_rs::config::OPTIGA_APPLICATION_ID;
 use optiga_trust_m_rs::ifx_i2c::headers::{ChainState, Pctr, Sctr};
 use optiga_trust_m_rs::pal::rust_crypto::RustCryptoBackend;
 use optiga_trust_m_rs::pal::HostCrypto;
+use sha2::{Digest, Sha256};
 
 /// Virtual slave APDU and Presentation Layer processor.
 #[derive(Debug)]
@@ -335,7 +338,7 @@ impl VirtualApduEngine {
         }
 
         let cmd = apdu[0] & 0x7F; // Strip 0x80 clear error flag
-        let _param = apdu[1];
+        let param = apdu[1];
         let in_len = u16::from_be_bytes([apdu[2], apdu[3]]) as usize;
         let in_data = if apdu.len() >= 4 + in_len {
             &apdu[4..4 + in_len]
@@ -351,14 +354,30 @@ impl VirtualApduEngine {
 
         match cmd {
             0x70 => {
-                // OpenApplication
+                // OpenApplication: verify 16-byte OPTIGA_APPLICATION_ID (or 24 bytes on hibernate restore)
+                let valid = if param == 0x01 {
+                    in_data.len() == 24 && in_data[..16] == OPTIGA_APPLICATION_ID
+                } else {
+                    in_data.is_empty() || (in_data.len() == 16 && in_data == OPTIGA_APPLICATION_ID)
+                };
+                if !valid {
+                    self.last_error_code = 0x02; // InvalidCommandField
+                    return vec![0xFF, 0x00, 0x00, 0x00];
+                }
                 self.app_opened = true;
                 vec![0x00, 0x00, 0x00, 0x00] // Success
             }
             0x71 => {
                 // CloseApplication
                 self.app_opened = false;
-                vec![0x00, 0x00, 0x00, 0x00]
+                if param == 0x01 {
+                    // Return 8-byte hibernate context handle
+                    vec![
+                        0x00, 0x00, 0x00, 0x08, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8,
+                    ]
+                } else {
+                    vec![0x00, 0x00, 0x00, 0x00]
+                }
             }
             0x01 => {
                 // GetDataObject
@@ -383,37 +402,101 @@ impl VirtualApduEngine {
                 let mut out = vec![0x00, 0x00];
                 out.extend_from_slice(&(req_len as u16).to_be_bytes());
                 for i in 0..req_len {
-                    out.push((i & 0xFF) as u8);
+                    out.push(((i + 1) & 0xFF) as u8);
                 }
                 out
             }
             0x02 => {
-                // SetDataObject
+                // SetDataObject: requires at least [OID(2B), Offset(2B), Data(>=1B)]
+                if in_data.len() < 5 {
+                    self.last_error_code = 0x02; // InvalidCommandField
+                    return vec![0xFF, 0x00, 0x00, 0x00];
+                }
                 vec![0x00, 0x00, 0x00, 0x00]
             }
+            0x03 => {
+                // SetObjectProtected: verify TLV tag 0x81, 0x82, or 0x83
+                let mut reader = TlvReader::new(in_data);
+                if let Some((tag, _val)) = reader.next() {
+                    if matches!(tag, 0x81..=0x83) {
+                        return vec![0x00, 0x00, 0x00, 0x00];
+                    }
+                }
+                self.last_error_code = 0x02;
+                vec![0xFF, 0x00, 0x00, 0x00]
+            }
+            0x30 => {
+                // CalcHash (SHA-256 = 0xE2)
+                let mut reader = TlvReader::new(in_data);
+                if let Some((tag, val)) = reader.next() {
+                    let digest = if tag == 0x00 {
+                        // StartFinal over host data
+                        Sha256::digest(val)
+                    } else if tag == 0x06 && val.len() == 6 {
+                        // Hash over OID data [0xDE, 0xAD, 0xBE, 0xEF]
+                        Sha256::digest([0xDE, 0xAD, 0xBE, 0xEF])
+                    } else {
+                        self.last_error_code = 0x02;
+                        return vec![0xFF, 0x00, 0x00, 0x00];
+                    };
+                    let mut out = vec![0x00, 0x00, 0x00, 35, 0x00, 0x00, 32];
+                    out.extend_from_slice(&digest);
+                    return out;
+                }
+                self.last_error_code = 0x02;
+                vec![0xFF, 0x00, 0x00, 0x00]
+            }
             0x38 => {
-                // GenKeyPair: Return TLV 0x02 (64-byte public key)
+                // GenKeyPair:
+                // Either (Tag 0x01 OID + Tag 0x02 KeyUsage, NO Tag 0x07) OR (Tag 0x07 empty value ONLY)
+                let mut reader = TlvReader::new(in_data);
+                let has_oid = reader.find_tag(0x01).is_some();
+                let has_usage = reader.find_tag(0x02).is_some();
+                let export_tag = reader.find_tag(0x07);
+
+                if (has_oid && export_tag.is_some())
+                    || (!has_oid && export_tag != Some(&[][..]))
+                    || (has_oid && !has_usage)
+                {
+                    self.last_error_code = 0x02; // InvalidCommandField
+                    return vec![0xFF, 0x00, 0x00, 0x00];
+                }
+
                 let mut pubkey = vec![0x04]; // Uncompressed point prefix
                 for i in 1..65 {
                     pubkey.push(i as u8);
                 }
+
+                let mut tlv_out = Vec::new();
+                if export_tag.is_some() {
+                    let privkey = vec![0xAA; 0x22];
+                    tlv_out.push(0x01);
+                    tlv_out.extend_from_slice(&(privkey.len() as u16).to_be_bytes());
+                    tlv_out.extend_from_slice(&privkey);
+                }
+                tlv_out.push(0x02);
+                tlv_out.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
+                tlv_out.extend_from_slice(&pubkey);
+
                 let mut out = vec![0x00, 0x00];
-                let out_len = (3 + pubkey.len()) as u16;
-                out.extend_from_slice(&out_len.to_be_bytes());
-                out.push(0x02); // Tag 0x02
-                out.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
-                out.extend_from_slice(&pubkey);
+                out.extend_from_slice(&(tlv_out.len() as u16).to_be_bytes());
+                out.extend_from_slice(&tlv_out);
                 out
             }
             0x31 => {
-                // CalcSign: Return TLV 0x02 (64-byte signature)
-                let sig = vec![0x55; 64];
+                // CalcSign: Return ASN.1 DER (r, s) INTEGER pair directly in OutData
+                // [0x02, 0x20, r(32B), 0x02, 0x20, s(32B)] = 68 bytes
+                let mut der_sig = Vec::with_capacity(68);
+                der_sig.push(0x02);
+                der_sig.push(0x20);
+                der_sig.extend_from_slice(&[0x55; 32]);
+                der_sig.push(0x02);
+                der_sig.push(0x20);
+                der_sig.extend_from_slice(&[0x66; 32]);
+
                 let mut out = vec![0x00, 0x00];
-                let out_len = (3 + sig.len()) as u16;
-                out.extend_from_slice(&out_len.to_be_bytes());
-                out.push(0x02); // Tag 0x02
-                out.extend_from_slice(&(sig.len() as u16).to_be_bytes());
-                out.extend_from_slice(&sig);
+                out.extend_from_slice(&(der_sig.len() as u16).to_be_bytes());
+                out.extend_from_slice(&der_sig);
                 out
             }
             0x32 => {
@@ -421,15 +504,55 @@ impl VirtualApduEngine {
                 vec![0x00, 0x00, 0x00, 0x00]
             }
             0x33 => {
-                // CalcSSec: Return TLV 0x07 (32-byte shared secret)
-                let ssec = vec![0x33; 32];
-                let mut out = vec![0x00, 0x00];
-                let out_len = (3 + ssec.len()) as u16;
-                out.extend_from_slice(&out_len.to_be_bytes());
-                out.push(0x07); // Tag 0x07
-                out.extend_from_slice(&(ssec.len() as u16).to_be_bytes());
-                out.extend_from_slice(&ssec);
-                out
+                // CalcSSec:
+                // Tag 0x07 (empty value) -> export raw shared secret directly in OutData
+                // Tag 0x08 (2B session OID) -> store in session, return empty OutData
+                let mut reader = TlvReader::new(in_data);
+                let export_tag = reader.find_tag(0x07);
+                let store_tag = reader.find_tag(0x08);
+                if export_tag == Some(&[][..]) {
+                    let ssec = vec![0x33; 32];
+                    let mut out = vec![0x00, 0x00];
+                    out.extend_from_slice(&(ssec.len() as u16).to_be_bytes());
+                    out.extend_from_slice(&ssec);
+                    out
+                } else if let Some(oid_bytes) = store_tag {
+                    if oid_bytes.len() == 2 {
+                        vec![0x00, 0x00, 0x00, 0x00]
+                    } else {
+                        self.last_error_code = 0x02;
+                        vec![0xFF, 0x00, 0x00, 0x00]
+                    }
+                } else {
+                    self.last_error_code = 0x02;
+                    vec![0xFF, 0x00, 0x00, 0x00]
+                }
+            }
+            0x34 => {
+                // DeriveKey:
+                // Tag 0x01 (2B secret OID), Tag 0x03 (2B key len), Tag 0x02 (derivation data),
+                // Tag 0x07 (empty export) OR Tag 0x08 (2B session OID)
+                let mut reader = TlvReader::new(in_data);
+                let key_len_bytes = match reader.find_tag(0x03) {
+                    Some(b) if b.len() == 2 => u16::from_be_bytes([b[0], b[1]]) as usize,
+                    _ => {
+                        self.last_error_code = 0x02;
+                        return vec![0xFF, 0x00, 0x00, 0x00];
+                    }
+                };
+                if reader.find_tag(0x07) == Some(&[][..]) {
+                    let mut out = vec![0x00, 0x00];
+                    out.extend_from_slice(&(key_len_bytes as u16).to_be_bytes());
+                    for i in 0..key_len_bytes {
+                        out.push((0xA0 + (i & 0x1F)) as u8);
+                    }
+                    out
+                } else if reader.find_tag(0x08).map(|b| b.len()) == Some(2) {
+                    vec![0x00, 0x00, 0x00, 0x00]
+                } else {
+                    self.last_error_code = 0x02;
+                    vec![0xFF, 0x00, 0x00, 0x00]
+                }
             }
             _ => {
                 // Generic success

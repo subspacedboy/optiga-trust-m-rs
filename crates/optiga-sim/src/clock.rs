@@ -69,6 +69,20 @@ impl DelayNs for SimulatedClock {
     }
 }
 
+impl embedded_hal_async::delay::DelayNs for SimulatedClock {
+    async fn delay_ns(&mut self, ns: u32) {
+        DelayNs::delay_ns(self, ns);
+    }
+
+    async fn delay_us(&mut self, us: u32) {
+        DelayNs::delay_us(self, us);
+    }
+
+    async fn delay_ms(&mut self, ms: u32) {
+        DelayNs::delay_ms(self, ms);
+    }
+}
+
 /// Record of a GPIO pin transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PinTransition {

@@ -53,6 +53,14 @@ pub const TL_HEADER_SIZE: usize = 1;
 /// Transport Layer maximum exit timeout in milliseconds (`TL_MAX_EXIT_TIMEOUT = 180 s = 180_000 ms`).
 pub const TL_MAX_EXIT_TIMEOUT_MS: u32 = 180_000;
 
+/// Maximum Transport Layer chaining error retry count (`TL_MAX_CHAINING_ERROR_COUNT = 1`).
+pub const TL_MAX_CHAINING_ERROR_COUNT: u8 = 1;
+
+/// Unique 16-byte OPTIGA™ Trust M Application Identifier (`g_optiga_unique_application_identifier`).
+pub const OPTIGA_APPLICATION_ID: [u8; 16] = [
+    0xD2, 0x76, 0x00, 0x00, 0x04, 0x47, 0x65, 0x6E, 0x41, 0x75, 0x74, 0x68, 0x41, 0x70, 0x70, 0x6C,
+];
+
 /// Presentation Layer header size for protected records (`IFX_I2C_PRL_HEADER_SIZE = 5`: 1B SCTR + 4B SeqNr).
 pub const PRL_HEADER_SIZE: usize = 5;
 

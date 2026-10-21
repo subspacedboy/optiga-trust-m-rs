@@ -98,7 +98,7 @@ fn test_pl_nack_exhaustion_fatal_error() {
 
 #[test]
 fn test_dl_sequence_rollover_roundtrip() {
-    let (clock, _chip, _bus, mut pl) = setup_test_rig();
+    let (_clock, _chip, _bus, mut pl) = setup_test_rig();
     assert!(pl.reset(ResetType::Warm).is_ok());
     assert!(pl.negotiate(277, 400).is_ok());
 
@@ -108,7 +108,7 @@ fn test_dl_sequence_rollover_roundtrip() {
     // Send 8 consecutive frames, verifying sequence numbers roll over: 0, 1, 2, 3, 0, 1, 2, 3
     for i in 0..8 {
         let payload = [0xA0, i as u8, 0x01, 0x02];
-        let event = dl.send_frame(&mut pl, &clock, &payload, &mut rx_buf).expect("send frame succeeds");
+        let event = dl.send_frame(&mut pl, &payload, &mut rx_buf).expect("send frame succeeds");
         assert!(matches!(event, DlEvent::TxSuccess | DlEvent::TxAndRxSuccess(_)));
         assert_eq!(dl.tx_seq_nr, (i as u8) & 0x03);
     }
@@ -116,7 +116,7 @@ fn test_dl_sequence_rollover_roundtrip() {
 
 #[test]
 fn test_dl_corrupted_response_crc_triggers_retransmit() {
-    let (clock, _chip, bus, mut pl) = setup_test_rig();
+    let (_clock, _chip, bus, mut pl) = setup_test_rig();
     assert!(pl.reset(ResetType::Warm).is_ok());
     assert!(pl.negotiate(277, 400).is_ok());
 
@@ -129,13 +129,13 @@ fn test_dl_corrupted_response_crc_triggers_retransmit() {
 
     let payload = [0x55, 0xAA];
     // Master should detect the CRC corruption, retransmit, and succeed on retry
-    let event = dl.send_frame(&mut pl, &clock, &payload, &mut rx_buf).expect("retransmits and succeeds");
+    let event = dl.send_frame(&mut pl, &payload, &mut rx_buf).expect("retransmits and succeeds");
     assert_eq!(event, DlEvent::TxSuccess);
 }
 
 #[test]
 fn test_dl_three_retries_resync_recovery() {
-    let (clock, chip, bus, mut pl) = setup_test_rig();
+    let (_clock, chip, bus, mut pl) = setup_test_rig();
     assert!(pl.reset(ResetType::Warm).is_ok());
     assert!(pl.negotiate(277, 400).is_ok());
 
@@ -146,9 +146,53 @@ fn test_dl_three_retries_resync_recovery() {
     bus.add_rule(FaultRule::NackNextReads(2));
 
     let payload = [0x11, 0x22, 0x33];
-    let event = dl.send_frame(&mut pl, &clock, &payload, &mut rx_buf).expect("send succeeds after retries");
+    let event = dl.send_frame(&mut pl, &payload, &mut rx_buf).expect("send succeeds after retries");
     assert_eq!(event, DlEvent::TxSuccess);
 
     // Verify 0 guard time violations occurred throughout all retries
     assert_eq!(chip.borrow().registers.guard_time_violations, 0);
+}
+
+#[test]
+fn test_dl_resync_when_seq_nonzero_updates_fctr_and_crc() {
+    let (_clock, _chip, bus, mut pl) = setup_test_rig();
+    assert!(pl.reset(ResetType::Warm).is_ok());
+    assert!(pl.negotiate(277, 400).is_ok());
+
+    let mut dl = DataLinkLayer::new();
+    let mut rx_buf = [0u8; 300];
+
+    // Send 2 frames so tx_seq_nr advances from 3 -> 0 -> 1
+    let _ = dl.send_frame(&mut pl, &[0x55, 0xAA], &mut rx_buf).unwrap();
+    let _ = dl.send_frame(&mut pl, &[0x55, 0xAA], &mut rx_buf).unwrap();
+    assert_eq!(dl.tx_seq_nr, 1);
+
+    // Corrupt the 5-byte Control Frame ACK 3 times in a row so the 3rd frame (initially FRNR = 2)
+    // exhausts DL_TRANS_REPEAT (3) and triggers perform_resync!
+    // After perform_resync, master and slave reset to 3 and master must re-encode the frame with FRNR = 0!
+    bus.add_rule(FaultRule::CorruptNextReadByte { offset: 4, mask: 0x01 });
+    bus.add_rule(FaultRule::CorruptNextReadByte { offset: 4, mask: 0x01 });
+    bus.add_rule(FaultRule::CorruptNextReadByte { offset: 4, mask: 0x01 });
+
+    let event = dl
+        .send_frame(&mut pl, &[0x55, 0xAA], &mut rx_buf)
+        .expect("resync updates FRNR to 0 and succeeds");
+    assert_eq!(event, DlEvent::TxSuccess);
+    assert_eq!(dl.tx_seq_nr, 0);
+}
+
+#[test]
+fn test_pl_volatile_and_persistent_slave_address_reset() {
+    let (_clock, _chip, _bus, mut pl) = setup_test_rig();
+    assert!(pl.reset(ResetType::Warm).is_ok());
+
+    // Change slave address to 0x32 in VOLATILE mode (persistent = false)
+    assert!(pl.write_slave_address(0x32, false).is_ok());
+    assert_eq!(pl.slave_address, 0x32);
+    assert_eq!(pl.configured_base_address, 0x30);
+
+    // Soft reset should revert both chip and PL active slave_address back to 0x30
+    assert!(pl.reset(ResetType::Soft).is_ok());
+    assert_eq!(pl.slave_address, 0x30);
+    assert!(pl.negotiate(277, 400).is_ok());
 }
