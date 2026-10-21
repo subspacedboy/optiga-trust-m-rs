@@ -15,6 +15,7 @@ pub struct VirtualApduEngine {
     pub force_next_command_failure: bool,
     pub app_opened: bool,
     pub slave_random: [u8; 32],
+    pub last_sent_response_apdu: Option<(u8, Vec<u8>)>,
 }
 
 impl Default for VirtualApduEngine {
@@ -28,6 +29,7 @@ impl Default for VirtualApduEngine {
             force_next_command_failure: false,
             app_opened: false,
             slave_random: [0x42; 32],
+            last_sent_response_apdu: None,
         }
     }
 }
@@ -227,6 +229,7 @@ impl VirtualApduEngine {
             };
 
             let resp_apdu = self.process_apdu(&apdu_in);
+            self.last_sent_response_apdu = Some((sctr.0, resp_apdu.clone()));
 
             // Construct response record
             let mut record_out = Vec::new();
@@ -271,6 +274,43 @@ impl VirtualApduEngine {
             let mut packet = vec![pctr.0];
             packet.extend_from_slice(&record_out);
             return Some(packet);
+        } else if sctr.is_alert() {
+            if sctr == Sctr::INTEGRITY_VIOLATED_ALERT {
+                // Slave retransmits last encrypted record with incremented slave_seq
+                let session_key = self.session_key?;
+                let (saved_sctr, resp_apdu) = self.last_sent_response_apdu.clone()?;
+                let mut dec_key = [0u8; 16];
+                dec_key.copy_from_slice(&session_key[16..32]);
+
+                self.slave_seq += 1;
+                let mut record_out = Vec::new();
+                record_out.push(saved_sctr);
+                record_out.extend_from_slice(&self.slave_seq.to_be_bytes());
+
+                let mut nonce = [0u8; 8];
+                nonce[0..4].copy_from_slice(&session_key[36..40]);
+                nonce[4..8].copy_from_slice(&self.slave_seq.to_be_bytes());
+
+                let mut aad = [0u8; 8];
+                aad[0] = saved_sctr;
+                aad[1..5].copy_from_slice(&self.slave_seq.to_be_bytes());
+                aad[5] = 0x01;
+                aad[6..8].copy_from_slice(&(resp_apdu.len() as u16).to_be_bytes());
+
+                let mut payload = resp_apdu;
+                let mut crypto = RustCryptoBackend;
+                let tag = crypto
+                    .aes128_ccm_8_encrypt(&dec_key, &nonce, &aad, &mut payload)
+                    .ok()?;
+
+                record_out.extend_from_slice(&payload);
+                record_out.extend_from_slice(&tag);
+
+                let pctr = Pctr::new(true, ChainState::No);
+                let mut packet = vec![pctr.0];
+                packet.extend_from_slice(&record_out);
+                return Some(packet);
+            }
         } else if sctr.is_manage_context() {
             if sctr == Sctr::SAVE_CONTEXT {
                 // Reply with ContextSaved [0x64]

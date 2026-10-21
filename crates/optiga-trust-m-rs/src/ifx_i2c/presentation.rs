@@ -290,133 +290,165 @@ where
         let sctr = Sctr::new_record(protection.level);
         self.saved_sctr = sctr.0;
 
-        let total_tx_len = match protection.level {
-            ProtectionLevel::Master | ProtectionLevel::Full => {
-                self.master_sequence_number = self.master_sequence_number.wrapping_add(1);
-                self.tx_record_buf[0] = sctr.0;
-                self.tx_record_buf[1..5].copy_from_slice(&self.master_sequence_number.to_be_bytes());
-                self.tx_record_buf[5..5 + tx_payload.len()].copy_from_slice(tx_payload);
+        let mut data_retransmit_counter = 0;
+        let mut decryption_failure_counter = 0;
 
-                let mut enc_key = [0u8; 16];
-                enc_key.copy_from_slice(&self.session_key[0..16]);
+        loop {
+            let total_tx_len = match protection.level {
+                ProtectionLevel::Master | ProtectionLevel::Full => {
+                    self.master_sequence_number = self.master_sequence_number.wrapping_add(1);
+                    self.tx_record_buf[0] = sctr.0;
+                    self.tx_record_buf[1..5].copy_from_slice(&self.master_sequence_number.to_be_bytes());
+                    self.tx_record_buf[5..5 + tx_payload.len()].copy_from_slice(tx_payload);
 
-                let mut nonce = [0u8; 8];
-                nonce[0..4].copy_from_slice(&self.session_key[32..36]);
-                nonce[4..8].copy_from_slice(&self.master_sequence_number.to_be_bytes());
+                    let mut enc_key = [0u8; 16];
+                    enc_key.copy_from_slice(&self.session_key[0..16]);
 
-                let mut aad = [0u8; 8];
-                aad[0] = sctr.0;
-                aad[1..5].copy_from_slice(&self.master_sequence_number.to_be_bytes());
-                aad[5] = 0x01;
-                aad[6..8].copy_from_slice(&(tx_payload.len() as u16).to_be_bytes());
+                    let mut nonce = [0u8; 8];
+                    nonce[0..4].copy_from_slice(&self.session_key[32..36]);
+                    nonce[4..8].copy_from_slice(&self.master_sequence_number.to_be_bytes());
 
-                let tag = self
-                    .crypto
-                    .aes128_ccm_8_encrypt(
-                        &enc_key,
-                        &nonce,
-                        &aad,
-                        &mut self.tx_record_buf[5..5 + tx_payload.len()],
-                    )
-                    .map_err(|_| IfxI2cError::SessionError)?;
+                    let mut aad = [0u8; 8];
+                    aad[0] = sctr.0;
+                    aad[1..5].copy_from_slice(&self.master_sequence_number.to_be_bytes());
+                    aad[5] = 0x01;
+                    aad[6..8].copy_from_slice(&(tx_payload.len() as u16).to_be_bytes());
 
-                self.tx_record_buf[5 + tx_payload.len()..13 + tx_payload.len()].copy_from_slice(&tag);
-                tx_payload.len() + 13
-            }
-            ProtectionLevel::None | ProtectionLevel::Slave => {
-                self.tx_record_buf[0] = sctr.0;
-                self.tx_record_buf[1..1 + tx_payload.len()].copy_from_slice(tx_payload);
-                tx_payload.len() + 1
-            }
-        };
+                    let tag = self
+                        .crypto
+                        .aes128_ccm_8_encrypt(
+                            &enc_key,
+                            &nonce,
+                            &aad,
+                            &mut self.tx_record_buf[5..5 + tx_payload.len()],
+                        )
+                        .map_err(|_| IfxI2cError::SessionError)?;
 
-        // Transceive record via Transport Layer
-        let rx_raw_len = tl.transceive(
-            pl,
-            dl,
-            clock,
-            &self.tx_record_buf[..total_tx_len],
-            &mut self.rx_record_buf,
-            true,
-        )?;
+                    self.tx_record_buf[5 + tx_payload.len()..13 + tx_payload.len()].copy_from_slice(&tag);
+                    tx_payload.len() + 13
+                }
+                ProtectionLevel::None | ProtectionLevel::Slave => {
+                    self.tx_record_buf[0] = sctr.0;
+                    self.tx_record_buf[1..1 + tx_payload.len()].copy_from_slice(tx_payload);
+                    tx_payload.len() + 1
+                }
+            };
 
-        // Verify incoming record response
-        if rx_raw_len < 1 {
-            return Err(IfxI2cError::ProtocolError);
-        }
+            // Transceive record via Transport Layer
+            let mut rx_raw_len = tl.transceive(
+                pl,
+                dl,
+                clock,
+                &self.tx_record_buf[..total_tx_len],
+                &mut self.rx_record_buf,
+                true,
+            )?;
 
-        let resp_sctr = self.rx_record_buf[0];
-        if resp_sctr & 0x40 != 0 {
-            // Alert received
-            self.reset();
-            return Err(IfxI2cError::SessionError);
-        }
-
-        if resp_sctr != self.saved_sctr {
-            self.reset();
-            return Err(IfxI2cError::SessionError);
-        }
-
-        match protection.level {
-            ProtectionLevel::Slave | ProtectionLevel::Full => {
-                if rx_raw_len <= 13 {
+            // Verify incoming record response loop (for alert retries)
+            loop {
+                if rx_raw_len < 1 {
                     return Err(IfxI2cError::ProtocolError);
                 }
 
-                let slave_seq = u32::from_be_bytes(self.rx_record_buf[1..5].try_into().unwrap());
-                if slave_seq <= self.save_slave_sequence_number
-                    || slave_seq > self.save_slave_sequence_number + (PRL_TRANS_REPEAT as u32)
-                {
-                    self.reset();
-                    return Err(IfxI2cError::SessionError);
-                }
-                self.save_slave_sequence_number = slave_seq;
+                let resp_sctr = self.rx_record_buf[0];
+                if resp_sctr & 0x40 != 0 {
+                    // Alert received
+                    if resp_sctr == Sctr::INTEGRITY_VIOLATED_ALERT.0
+                        && rx_raw_len == 1
+                        && matches!(protection.level, ProtectionLevel::Master | ProtectionLevel::Full)
+                        && data_retransmit_counter < PRL_TRANS_REPEAT
+                    {
+                        data_retransmit_counter += 1;
+                        break; // Break out to re-encrypt with incremented master_seq and retransmit
+                    }
 
-                let plain_len = rx_raw_len - 13;
-                let mut dec_key = [0u8; 16];
-                dec_key.copy_from_slice(&self.session_key[16..32]);
-
-                let mut nonce = [0u8; 8];
-                nonce[0..4].copy_from_slice(&self.session_key[36..40]);
-                nonce[4..8].copy_from_slice(&slave_seq.to_be_bytes());
-
-                let mut aad = [0u8; 8];
-                aad[0] = resp_sctr;
-                aad[1..5].copy_from_slice(&slave_seq.to_be_bytes());
-                aad[5] = 0x01;
-                aad[6..8].copy_from_slice(&(plain_len as u16).to_be_bytes());
-
-                let mut tag = [0u8; 8];
-                tag.copy_from_slice(&self.rx_record_buf[5 + plain_len..13 + plain_len]);
-
-                if self
-                    .crypto
-                    .aes128_ccm_8_decrypt(
-                        &dec_key,
-                        &nonce,
-                        &aad,
-                        &mut self.rx_record_buf[5..5 + plain_len],
-                        &tag,
-                    )
-                    .is_err()
-                {
                     self.reset();
                     return Err(IfxI2cError::SessionError);
                 }
 
-                if plain_len > rx_payload.len() {
-                    return Err(IfxI2cError::MemoryInsufficient);
+                if resp_sctr != self.saved_sctr {
+                    self.reset();
+                    return Err(IfxI2cError::SessionError);
                 }
-                rx_payload[..plain_len].copy_from_slice(&self.rx_record_buf[5..5 + plain_len]);
-                Ok(plain_len)
-            }
-            ProtectionLevel::None | ProtectionLevel::Master => {
-                let plain_len = rx_raw_len - 1;
-                if plain_len > rx_payload.len() {
-                    return Err(IfxI2cError::MemoryInsufficient);
+
+                match protection.level {
+                    ProtectionLevel::Slave | ProtectionLevel::Full => {
+                        if rx_raw_len <= 13 {
+                            return Err(IfxI2cError::ProtocolError);
+                        }
+
+                        let slave_seq = u32::from_be_bytes(self.rx_record_buf[1..5].try_into().unwrap());
+                        if slave_seq <= self.save_slave_sequence_number
+                            || slave_seq > self.save_slave_sequence_number + (PRL_TRANS_REPEAT as u32)
+                        {
+                            self.reset();
+                            return Err(IfxI2cError::SessionError);
+                        }
+
+                        let plain_len = rx_raw_len - 13;
+                        let mut dec_key = [0u8; 16];
+                        dec_key.copy_from_slice(&self.session_key[16..32]);
+
+                        let mut nonce = [0u8; 8];
+                        nonce[0..4].copy_from_slice(&self.session_key[36..40]);
+                        nonce[4..8].copy_from_slice(&slave_seq.to_be_bytes());
+
+                        let mut aad = [0u8; 8];
+                        aad[0] = resp_sctr;
+                        aad[1..5].copy_from_slice(&slave_seq.to_be_bytes());
+                        aad[5] = 0x01;
+                        aad[6..8].copy_from_slice(&(plain_len as u16).to_be_bytes());
+
+                        let mut tag = [0u8; 8];
+                        tag.copy_from_slice(&self.rx_record_buf[5 + plain_len..13 + plain_len]);
+
+                        if self
+                            .crypto
+                            .aes128_ccm_8_decrypt(
+                                &dec_key,
+                                &nonce,
+                                &aad,
+                                &mut self.rx_record_buf[5..5 + plain_len],
+                                &tag,
+                            )
+                            .is_err()
+                        {
+                            if decryption_failure_counter < PRL_TRANS_REPEAT {
+                                decryption_failure_counter += 1;
+                                // Send 1-byte Integrity Violated Alert [0x44]
+                                let alert = [Sctr::INTEGRITY_VIOLATED_ALERT.0];
+                                rx_raw_len = tl.transceive(
+                                    pl,
+                                    dl,
+                                    clock,
+                                    &alert,
+                                    &mut self.rx_record_buf,
+                                    true,
+                                )?;
+                                continue;
+                            } else {
+                                self.reset();
+                                return Err(IfxI2cError::SessionError);
+                            }
+                        }
+
+                        self.save_slave_sequence_number = slave_seq;
+
+                        if plain_len > rx_payload.len() {
+                            return Err(IfxI2cError::MemoryInsufficient);
+                        }
+                        rx_payload[..plain_len].copy_from_slice(&self.rx_record_buf[5..5 + plain_len]);
+                        return Ok(plain_len);
+                    }
+                    ProtectionLevel::None | ProtectionLevel::Master => {
+                        let plain_len = rx_raw_len - 1;
+                        if plain_len > rx_payload.len() {
+                            return Err(IfxI2cError::MemoryInsufficient);
+                        }
+                        rx_payload[..plain_len].copy_from_slice(&self.rx_record_buf[1..rx_raw_len]);
+                        return Ok(plain_len);
+                    }
                 }
-                rx_payload[..plain_len].copy_from_slice(&self.rx_record_buf[1..rx_raw_len]);
-                Ok(plain_len)
             }
         }
     }
