@@ -1,0 +1,18 @@
+[package]
+name = "optiga-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Host-side virtual OPTIGA Trust M hardware emulator and fault injection harness"
+
+[dependencies]
+optiga-trust-m-rs = { workspace = true }
+embedded-hal = { workspace = true }
+aes = { workspace = true }
+ccm = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+
+[dev-dependencies]
+hex-literal = "0.4"

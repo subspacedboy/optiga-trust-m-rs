@@ -1,0 +1,19 @@
+[package]
+name = "optiga-trust-m-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure Rust, #![no_std], zero-heap driver for Infineon OPTIGA Trust M security chip"
+readme = "README.md"
+
+[dependencies]
+embedded-hal = { workspace = true }
+aes = { workspace = true }
+ccm = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+hex-literal = "0.4"
