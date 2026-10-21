@@ -347,6 +347,50 @@ impl VirtualApduEngine {
                 }
                 out
             }
+            0x02 => {
+                // SetDataObject
+                vec![0x00, 0x00, 0x00, 0x00]
+            }
+            0x38 => {
+                // GenKeyPair: Return TLV 0x02 (64-byte public key)
+                let mut pubkey = vec![0x04]; // Uncompressed point prefix
+                for i in 1..65 {
+                    pubkey.push(i as u8);
+                }
+                let mut out = vec![0x00, 0x00];
+                let out_len = (3 + pubkey.len()) as u16;
+                out.extend_from_slice(&out_len.to_be_bytes());
+                out.push(0x02); // Tag 0x02
+                out.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
+                out.extend_from_slice(&pubkey);
+                out
+            }
+            0x31 => {
+                // CalcSign: Return TLV 0x02 (64-byte signature)
+                let sig = vec![0x55; 64];
+                let mut out = vec![0x00, 0x00];
+                let out_len = (3 + sig.len()) as u16;
+                out.extend_from_slice(&out_len.to_be_bytes());
+                out.push(0x02); // Tag 0x02
+                out.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+                out.extend_from_slice(&sig);
+                out
+            }
+            0x32 => {
+                // VerifySign
+                vec![0x00, 0x00, 0x00, 0x00]
+            }
+            0x33 => {
+                // CalcSSec: Return TLV 0x07 (32-byte shared secret)
+                let ssec = vec![0x33; 32];
+                let mut out = vec![0x00, 0x00];
+                let out_len = (3 + ssec.len()) as u16;
+                out.extend_from_slice(&out_len.to_be_bytes());
+                out.push(0x07); // Tag 0x07
+                out.extend_from_slice(&(ssec.len() as u16).to_be_bytes());
+                out.extend_from_slice(&ssec);
+                out
+            }
             _ => {
                 // Generic success
                 vec![0x00, 0x00, 0x00, 0x00]
