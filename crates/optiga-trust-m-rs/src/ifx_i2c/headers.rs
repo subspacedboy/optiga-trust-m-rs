@@ -426,8 +426,8 @@ mod tests {
         frame[0] = 0x00; // Data frame
         frame[1] = 0x01; // Length MSB
         frame[2] = 0x10; // Length LSB (272)
-        for i in 3..275 {
-            frame[i] = (i & 0xFF) as u8;
+        for (idx, byte) in frame[3..275].iter_mut().enumerate() {
+            *byte = ((idx + 3) & 0xFF) as u8;
         }
         let base_crc = crc16_ccitt(&frame[..275]);
         for byte_idx in 0..275 {
