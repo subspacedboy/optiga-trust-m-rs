@@ -96,8 +96,31 @@ impl VirtualOptiga {
                             if let Some(resp_packet) =
                                 self.apdu.process_tl_packet(&payload, &self.shared_secret)
                             {
-                                // Fragment response if necessary (single fragment for now)
-                                self.dl.queue_data_frame(&resp_packet);
+                                let max_packet_len = (self.registers.max_frame_len as usize).saturating_sub(6);
+                                if resp_packet.len() <= max_packet_len + 1 {
+                                    self.dl.queue_data_frame(&resp_packet);
+                                } else {
+                                    // Fragment response into First / Intermediate / Last
+                                    use optiga_trust_m_rs::ifx_i2c::headers::{ChainState, Pctr};
+                                    let has_pres = (resp_packet[0] & 0x08) != 0;
+                                    let body = &resp_packet[1..];
+                                    let mut offset = 0;
+                                    while offset < body.len() {
+                                        let rem = body.len() - offset;
+                                        let chunk_len = core::cmp::min(rem, max_packet_len);
+                                        let chain = if offset == 0 && rem > max_packet_len {
+                                            ChainState::First
+                                        } else if offset > 0 && rem > max_packet_len {
+                                            ChainState::Intermediate
+                                        } else {
+                                            ChainState::Last
+                                        };
+                                        let mut frag = vec![Pctr::new(has_pres, chain).0];
+                                        frag.extend_from_slice(&body[offset..offset + chunk_len]);
+                                        self.dl.queue_data_frame(&frag);
+                                        offset += chunk_len;
+                                    }
+                                }
                             } else {
                                 // Send ACK CF if no immediate upper response
                                 self.dl.queue_control_frame(SeqCtrl::Ack, self.dl.rx_seq_nr);

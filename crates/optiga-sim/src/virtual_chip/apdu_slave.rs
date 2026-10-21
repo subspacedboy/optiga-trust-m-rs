@@ -139,8 +139,6 @@ impl VirtualApduEngine {
             } else if sctr == Sctr::MASTER_FINISHED && self.rx_apdu_buf.len() == 49 {
                 // MasterFinished received: [0x08, SlaveSeq(4B), Ciphertext(36B), Tag(8B)]
                 if let Some(session_key) = self.session_key {
-                    let mut enc_key = [0u8; 16];
-                    enc_key.copy_from_slice(&session_key[0..16]);
                     let mut dec_key = [0u8; 16];
                     dec_key.copy_from_slice(&session_key[16..32]);
 
@@ -185,6 +183,105 @@ impl VirtualApduEngine {
                     packet.extend_from_slice(&out_payload);
                     return Some(packet);
                 }
+            }
+        } else if sctr.is_record_exchange() {
+            let level = sctr.protection_level();
+            let apdu_in = match level {
+                optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Master
+                | optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Full => {
+                    let session_key = self.session_key?;
+                    let mut enc_key = [0u8; 16];
+                    enc_key.copy_from_slice(&session_key[0..16]);
+
+                    if self.rx_apdu_buf.len() <= 13 {
+                        return None;
+                    }
+                    let master_seq = u32::from_be_bytes(self.rx_apdu_buf[1..5].try_into().unwrap());
+                    self.master_seq = master_seq;
+
+                    let plain_len = self.rx_apdu_buf.len() - 13;
+                    let mut nonce = [0u8; 8];
+                    nonce[0..4].copy_from_slice(&session_key[32..36]);
+                    nonce[4..8].copy_from_slice(&master_seq.to_be_bytes());
+
+                    let mut aad = [0u8; 8];
+                    aad[0] = sctr.0;
+                    aad[1..5].copy_from_slice(&master_seq.to_be_bytes());
+                    aad[5] = 0x01;
+                    aad[6..8].copy_from_slice(&(plain_len as u16).to_be_bytes());
+
+                    let mut tag = [0u8; 8];
+                    tag.copy_from_slice(&self.rx_apdu_buf[5 + plain_len..13 + plain_len]);
+
+                    let mut payload = self.rx_apdu_buf[5..5 + plain_len].to_vec();
+                    let mut crypto = RustCryptoBackend;
+                    crypto
+                        .aes128_ccm_8_decrypt(&enc_key, &nonce, &aad, &mut payload, &tag)
+                        .ok()?;
+                    payload
+                }
+                optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::None
+                | optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Slave => {
+                    self.rx_apdu_buf[1..].to_vec()
+                }
+            };
+
+            let resp_apdu = self.process_apdu(&apdu_in);
+
+            // Construct response record
+            let mut record_out = Vec::new();
+            record_out.push(sctr.0);
+
+            match level {
+                optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Slave
+                | optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Full => {
+                    let session_key = self.session_key?;
+                    let mut dec_key = [0u8; 16];
+                    dec_key.copy_from_slice(&session_key[16..32]);
+
+                    self.slave_seq += 1;
+                    record_out.extend_from_slice(&self.slave_seq.to_be_bytes());
+
+                    let mut nonce = [0u8; 8];
+                    nonce[0..4].copy_from_slice(&session_key[36..40]);
+                    nonce[4..8].copy_from_slice(&self.slave_seq.to_be_bytes());
+
+                    let mut aad = [0u8; 8];
+                    aad[0] = sctr.0;
+                    aad[1..5].copy_from_slice(&self.slave_seq.to_be_bytes());
+                    aad[5] = 0x01;
+                    aad[6..8].copy_from_slice(&(resp_apdu.len() as u16).to_be_bytes());
+
+                    let mut payload = resp_apdu;
+                    let mut crypto = RustCryptoBackend;
+                    let tag = crypto
+                        .aes128_ccm_8_encrypt(&dec_key, &nonce, &aad, &mut payload)
+                        .ok()?;
+
+                    record_out.extend_from_slice(&payload);
+                    record_out.extend_from_slice(&tag);
+                }
+                optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::None
+                | optiga_trust_m_rs::ifx_i2c::headers::ProtectionLevel::Master => {
+                    record_out.extend_from_slice(&resp_apdu);
+                }
+            }
+
+            let pctr = Pctr::new(true, ChainState::No);
+            let mut packet = vec![pctr.0];
+            packet.extend_from_slice(&record_out);
+            return Some(packet);
+        } else if sctr.is_manage_context() {
+            if sctr == Sctr::SAVE_CONTEXT {
+                // Reply with ContextSaved [0x64]
+                let pctr = Pctr::new(true, ChainState::No);
+                return Some(vec![pctr.0, 0x64]);
+            } else if sctr == Sctr::RESTORE_CONTEXT && self.rx_apdu_buf.len() == 5 {
+                // Reply with ContextRestored [0x6C, slave_seq(4B)]
+                let pctr = Pctr::new(true, ChainState::No);
+                let mut out = vec![pctr.0, 0x6C];
+                out.extend_from_slice(&self.slave_seq.to_be_bytes());
+                return Some(out);
             }
         }
 

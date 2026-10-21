@@ -11,5 +11,9 @@ pub mod ifx_i2c;
 pub mod pal;
 
 pub use error::{DeviceError, IfxI2cError, OptigaError};
+pub use ifx_i2c::{
+    DataLinkLayer, IfxI2cStack, PhysicalLayer, PresentationLayer, ProtectionConfig,
+    ProtectionLevel, ResetType, TransportLayer,
+};
 pub use pal::rust_crypto::{CryptoError, RustCryptoBackend};
 pub use pal::{Datastore, DatastoreId, HostCrypto, MonotonicClock, NoPin, OptigaI2cBus};
