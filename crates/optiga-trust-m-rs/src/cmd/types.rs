@@ -162,9 +162,9 @@ pub struct KeyUsage(pub u8);
 
 impl KeyUsage {
     pub const AUTH: u8 = 0x01;
-    pub const SIGN: u8 = 0x02;
-    pub const KEY_AGREEMENT: u8 = 0x04;
-    pub const ENCRYPT: u8 = 0x08;
+    pub const ENCRYPT: u8 = 0x02;
+    pub const SIGN: u8 = 0x10;
+    pub const KEY_AGREEMENT: u8 = 0x20;
 
     pub const fn auth_and_sign() -> Self {
         Self(Self::AUTH | Self::SIGN)
@@ -172,6 +172,10 @@ impl KeyUsage {
 
     pub const fn key_agreement() -> Self {
         Self(Self::KEY_AGREEMENT)
+    }
+
+    pub const fn all() -> Self {
+        Self(Self::AUTH | Self::ENCRYPT | Self::SIGN | Self::KEY_AGREEMENT)
     }
 }
 
